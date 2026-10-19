@@ -5,12 +5,23 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 
 namespace strata::core {
 namespace {
+// STRATA_SNAPSHOT_NOFILL=0 keeps the previous zero-filled growth for an A/B on
+// one binary; only an explicit 1 enables the overwrite path.
+bool nofill() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SNAPSHOT_NOFILL");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
 struct Layout {
     int format;
     int64_t cells, pooled_rows, page_size;
@@ -171,7 +182,11 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
-        dst[i]->resize(sizes[i]);
+        // The copy overwrites [keep, sizes[i]), including every newly grown byte.
+        // Leave the previous zero-filled path as the default; opt in with
+        // STRATA_SNAPSHOT_NOFILL=1 for same-binary comparisons.
+        if (nofill()) dst[i]->resize_for_overwrite(sizes[i]);
+        else dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
             })) return false;
